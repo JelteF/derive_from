@@ -216,13 +216,6 @@ pub fn named_to_vec(fields: &FieldsNamed) -> Vec<&Field> {
     fields.named.iter().collect()
 }
 
-fn panic_one_field(trait_name: &str, trait_attr: &str) -> ! {
-    panic!(format!(
-        "derive({}) only works when forwarding to a single field. Try putting #[{}] or #[{}(ignore)] on the fields in the struct",
-        trait_name, trait_attr, trait_attr,
-    ))
-}
-
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DeriveType {
     Unnamed,
@@ -409,7 +402,7 @@ impl<'input> State<'input> {
                 data_enum.variants.iter().collect(),
             ),
             Data::Union(_) => {
-                panic!(format!("can not derive({}) for union", trait_name))
+                panic!(format!("cannot derive({}) for union", trait_name))
             }
         };
         let attrs: Vec<_> = if derive_type == DeriveType::Enum {
@@ -532,7 +525,7 @@ impl<'input> State<'input> {
         trait_attr: String,
         allowed_attr_params: AttrParams,
         variant: &'arg_input Variant,
-        default_info: FullMetaInfo,
+        mut default_info: FullMetaInfo,
     ) -> Result<State<'arg_input>> {
         let trait_name = trait_name.trim_end_matches("ToInner");
         let trait_ident = Ident::new(trait_name, Span::call_site());
@@ -553,6 +546,35 @@ impl<'input> State<'input> {
             .map(|attrs| get_meta_info(&trait_attr, attrs, &allowed_attr_params.field))
             .collect();
         let meta_infos = meta_infos?;
+        let first_match = meta_infos
+            .iter()
+            .filter_map(|info| info.enabled.map(|_| info))
+            .next();
+        // Default enabled to whatever it was, except when first attribute has
+        // explicit enabling.
+        //
+        // Except for derive Error.
+        //
+        // The way `else` case works is that if any field have any valid
+        // attribute specified, then all fields without any attributes
+        // specified are filtered out from `State::enabled_fields`.
+        //
+        // However, derive Error *infers* fields and there are cases when
+        // one of the fields may have an attribute specified, but another field
+        // would be inferred. So, for derive Error macro we default enabled
+        // to true unconditionally (i.e., even if some fields have attributes
+        // specified).
+        //
+        // NOTE: The Index/IndexMut thing will be removed for 1.0.0, this is to
+        // make sure this new behaviour does not break any use cases for other
+        // traits:
+        default_info.enabled = if trait_name == "Error" {
+            true
+        } else if trait_name != "Index" && trait_name != "IndexMut" {
+            default_info.enabled
+        } else {
+            first_match.map_or(default_info.enabled, |info| !info.enabled.unwrap())
+        };
         let full_meta_infos: Vec<_> = meta_infos
             .into_iter()
             .map(|info| info.into_full(default_info.clone()))
@@ -581,21 +603,46 @@ impl<'input> State<'input> {
         })
     }
     pub fn add_trait_path_type_param(&mut self, param: TokenStream) {
+        for variant_state in self.variant_states.iter_mut() {
+            variant_state.add_trait_path_type_param(param.clone());
+        }
         self.trait_path_params.push(param);
+    }
+
+    fn panic_if_enum(&self) {
+        if self.derive_type == DeriveType::Enum {
+            panic!(format!("cannot derive({}) for enum", self.trait_name))
+        }
     }
 
     pub fn assert_single_enabled_field<'state>(
         &'state self,
     ) -> SingleFieldData<'input, 'state> {
-        if self.derive_type == DeriveType::Enum {
-            panic_one_field(self.trait_name, &self.trait_attr);
-        }
+        self.panic_if_enum();
         let data = self.enabled_fields_data();
         if data.fields.len() != 1 {
-            panic_one_field(self.trait_name, &self.trait_attr);
+            let struct_or_variant = if self.variant.is_some() {
+                "variant"
+            } else {
+                "struct"
+            };
+            panic!(format!(
+                "derive({}) only works when forwarding to a single field. Try putting #[{}] or #[{}(ignore)] on the fields in the {}",
+                self.trait_name, self.trait_attr, self.trait_attr, struct_or_variant
+            ));
         };
+        let input_type = &self.input.ident;
+        let (variant_name, variant_type) = self.variant.map_or_else(
+            || (None, quote!(#input_type)),
+            |v| {
+                let variant_name = &v.ident;
+                (Some(variant_name), quote!(#input_type::#variant_name))
+            },
+        );
         SingleFieldData {
-            input_type: data.input_type,
+            input_type,
+            variant_type,
+            variant_name,
             field: data.fields[0],
             field_type: data.field_types[0],
             member: data.members[0].clone(),
@@ -612,9 +659,7 @@ impl<'input> State<'input> {
     }
 
     pub fn enabled_fields_data<'state>(&'state self) -> MultiFieldData<'input, 'state> {
-        if self.derive_type == DeriveType::Enum {
-            panic!(format!("can not derive({}) for enum", self.trait_name))
-        }
+        self.panic_if_enum();
         let fields = self.enabled_fields();
         let field_idents = self.enabled_fields_idents();
         let field_indexes = self.enabled_fields_indexes();
@@ -675,12 +720,19 @@ impl<'input> State<'input> {
         let variants = self.enabled_variants();
         let trait_path = &self.trait_path;
         let (impl_generics, ty_generics, where_clause) = self.generics.split_for_impl();
+        let trait_path_with_params = if !self.trait_path_params.is_empty() {
+            let params = self.trait_path_params.iter();
+            quote!(#trait_path<#(#params),*>)
+        } else {
+            self.trait_path.clone()
+        };
         MultiVariantData {
             input_type: &self.input.ident,
             variants,
             variant_states: self.enabled_variant_states(),
             infos: self.enabled_infos(),
             trait_path,
+            trait_path_with_params,
             impl_generics,
             ty_generics,
             where_clause,
@@ -763,6 +815,8 @@ impl<'input> State<'input> {
 #[derive(Clone)]
 pub struct SingleFieldData<'input, 'state> {
     pub input_type: &'input Ident,
+    pub variant_type: TokenStream,
+    pub variant_name: Option<&'input Ident>,
     pub field: &'input Field,
     pub field_type: &'input Type,
     pub field_ident: TokenStream,
@@ -805,6 +859,7 @@ pub struct MultiVariantData<'input, 'state> {
     pub variant_states: Vec<&'state State<'input>>,
     pub infos: Vec<FullMetaInfo>,
     pub trait_path: &'state TokenStream,
+    pub trait_path_with_params: TokenStream,
     pub impl_generics: ImplGenerics<'state>,
     pub ty_generics: TypeGenerics<'state>,
     pub where_clause: Option<&'state WhereClause>,
@@ -847,6 +902,13 @@ impl<'input, 'state> MultiFieldData<'input, 'state> {
 impl<'input, 'state> SingleFieldData<'input, 'state> {
     pub fn initializer<T: ToTokens>(&self, initializers: &[T]) -> TokenStream {
         self.multi_field_data.initializer(initializers)
+    }
+    pub fn matcher<T: ToTokens>(
+        &self,
+        indexes: &[usize],
+        bindings: &[T],
+    ) -> TokenStream {
+        self.multi_field_data.matcher(indexes, bindings)
     }
 }
 
